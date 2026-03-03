@@ -1,5 +1,5 @@
 const express = require('express');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -8,6 +8,13 @@ app.use(express.json({ limit: '10mb' }));
 
 const COBALT_URL = process.env.COBALT_UPSTREAM_URL || 'https://cobalt-production-a07d.up.railway.app';
 const PORT = process.env.PORT || 3000;
+
+// Detect Node.js path for yt-dlp JS runtime
+let NODE_PATH = '/usr/local/bin/node';
+try {
+  NODE_PATH = execSync('which node').toString().trim();
+} catch (e) {}
+console.log(`[startup] Node.js path for yt-dlp: ${NODE_PATH}`);
 
 // Concurrency limiter — max 2 yt-dlp jobs at once to prevent OOM
 let activeJobs = 0;
@@ -38,13 +45,30 @@ function runWithConcurrencyLimit(fn) {
   });
 }
 
+// Build yt-dlp command with JS runtime so YouTube extraction works
+function buildYtDlpCmd(videoId, outFile) {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  // Pass Node.js as the JS runtime so yt-dlp can extract YouTube formats
+  // Also use android_vr player client as fallback which doesn't need JS
+  return [
+    'yt-dlp',
+    '-x',
+    '--audio-format mp3',
+    '--audio-quality 5',
+    `-o "${outFile}"`,
+    '--no-playlist',
+    `--js-runtimes "node:${NODE_PATH}"`,
+    '--extractor-args "youtube:player_client=android_vr,web"',
+    `"${ytUrl}"`,
+  ].join(' ');
+}
+
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'cobalt-audio-proxy', activeJobs, queued: jobQueue.length });
+  res.json({ status: 'ok', service: 'cobalt-audio-proxy', activeJobs, queued: jobQueue.length, nodePath: NODE_PATH });
 });
 
-// Download proxy: accepts a videoId, calls Cobalt API internally,
-// buffers the tunnel stream, and returns raw audio bytes
+// Download proxy: accepts a videoId, calls Cobalt API internally
 app.post('/download', async (req, res) => {
   try {
     const { videoId, url: tunnelUrl } = req.body;
@@ -69,13 +93,11 @@ app.post('/download', async (req, res) => {
 
     if (!audioUrl) return res.status(400).json({ error: 'No URL or videoId provided' });
 
-    console.log(`[download-proxy] Downloading audio from tunnel URL`);
     const audioRes = await fetch(audioUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     });
     if (!audioRes.ok) return res.status(502).json({ error: `Tunnel fetch failed: ${audioRes.status}` });
     const buffer = Buffer.from(await audioRes.arrayBuffer());
-    console.log(`[download-proxy] Downloaded ${buffer.length} bytes`);
     if (buffer.length === 0) return res.status(502).json({ error: 'Tunnel returned 0 bytes' });
     res.setHeader('Content-Type', 'audio/mpeg');
     res.send(buffer);
@@ -91,25 +113,23 @@ app.post('/ytdlp', async (req, res) => {
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
 
   const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp3`);
-  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const cmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${outFile}" --no-playlist "${ytUrl}"`;
+  const cmd = buildYtDlpCmd(videoId, outFile);
 
-  console.log(`[ytdlp] Queued job for ${videoId} (active: ${activeJobs}, queued: ${jobQueue.length})`);
+  console.log(`[ytdlp] Queued job for ${videoId} (active: ${activeJobs}/${MAX_CONCURRENT}, queued: ${jobQueue.length})`);
 
-  // If caller provided a callbackUrl, respond immediately and process in background
   if (callbackUrl) {
     res.status(202).json({ status: 'accepted', videoId, activeJobs, queued: jobQueue.length });
 
     runWithConcurrencyLimit(() => new Promise((resolve) => {
-      console.log(`[ytdlp] Starting download for ${videoId} (active slots: ${activeJobs}/${MAX_CONCURRENT})`);
-      exec(cmd, { timeout: 300000 }, async (err) => {
+      console.log(`[ytdlp] Starting download for ${videoId}`);
+      exec(cmd, { timeout: 300000 }, async (err, stdout, stderr) => {
         if (err) {
-          console.error(`[ytdlp] yt-dlp error for ${videoId}:`, err.message?.substring(0, 200));
+          const errMsg = (stderr || err.message || '').substring(0, 300);
+          console.error(`[ytdlp] Error for ${videoId}:`, errMsg);
           resolve();
           return;
         }
         try {
-          // Stream file to callback instead of loading into memory
           const stat = fs.statSync(outFile);
           console.log(`[ytdlp] Sending ${stat.size} bytes to callback for ${videoId}`);
           const fileStream = fs.createReadStream(outFile);
@@ -133,17 +153,12 @@ app.post('/ytdlp', async (req, res) => {
     return;
   }
 
-  // No callback - synchronous mode
+  // Synchronous mode (no callback)
   try {
     await runWithConcurrencyLimit(() => new Promise((resolve, reject) => {
-      console.log(`[ytdlp] Sync download for ${videoId}`);
-      exec(cmd, { timeout: 300000 }, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
+      exec(cmd, { timeout: 300000 }, (err) => { if (err) reject(err); else resolve(); });
     }));
     const audioBuffer = fs.readFileSync(outFile);
-    console.log(`[ytdlp] Returning ${audioBuffer.length} bytes for ${videoId}`);
     res.set('Content-Type', 'audio/mpeg');
     res.send(audioBuffer);
   } catch (err) {
