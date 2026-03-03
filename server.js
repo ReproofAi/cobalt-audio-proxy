@@ -98,7 +98,6 @@ function buildYtDlpCmd(videoId, outFile) {
   return [
     'yt-dlp', '-x',
     '--audio-format opus', '--audio-quality 9',
-    '--postprocessor-args', 'ffmpeg:-ac 1 -b:a 32k',
     `-o "${outFile}"`,
     '--no-playlist', '--no-check-certificates', '--age-limit 99',
     `--js-runtimes "node:${NODE_PATH}"`,
@@ -155,7 +154,7 @@ app.post('/ytdlp', async (req, res) => {
     }
 
     console.log(`[ytdlp] Transcript API failed, falling back to yt-dlp audio: ${videoId}`);
-    const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp3`);
+    const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.ogg`);
     const cmd = buildYtDlpCmd(videoId, outFile);
     console.log(`[ytdlp] Starting download: ${videoId}`);
 
