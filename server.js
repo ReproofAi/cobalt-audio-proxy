@@ -14,9 +14,23 @@ let NODE_PATH = '/usr/local/bin/node';
 try { NODE_PATH = execSync('which node').toString().trim(); } catch (e) {}
 console.log(`[startup] Node.js path for yt-dlp: ${NODE_PATH}`);
 
-// Concurrency config
-const MAX_CONCURRENT = 2;
-const MAX_QUEUE = 4;
+// Write YouTube cookies file from env var
+const COOKIES_FILE = path.join(os.tmpdir(), 'yt-cookies.txt');
+if (process.env.YOUTUBE_COOKIES_B64) {
+  try {
+    const decoded = Buffer.from(process.env.YOUTUBE_COOKIES_B64, 'base64').toString('utf8');
+    fs.writeFileSync(COOKIES_FILE, decoded);
+    console.log('[startup] YouTube cookies file written to', COOKIES_FILE);
+  } catch (e) {
+    console.error('[startup] Failed to write cookies file:', e.message);
+  }
+} else {
+  console.warn('[startup] YOUTUBE_COOKIES_B64 not set - bot detection may occur');
+}
+
+// Concurrency config - keep at 1 to avoid OOM and rate limiting
+const MAX_CONCURRENT = 1;
+const MAX_QUEUE = 3;
 
 let activeJobs = 0;
 const jobQueue = [];
@@ -47,6 +61,7 @@ function runWithConcurrencyLimit(fn) {
 
 function buildYtDlpCmd(videoId, outFile) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cookiesArg = fs.existsSync(COOKIES_FILE) ? `--cookies "${COOKIES_FILE}"` : '';
   return [
     'yt-dlp',
     '-x',
@@ -57,8 +72,9 @@ function buildYtDlpCmd(videoId, outFile) {
     `--js-runtimes "node:${NODE_PATH}"`,
     '--extractor-args "youtube:player_client=ios,android,mweb"',
     '--no-check-certificates',
+    cookiesArg,
     `"${ytUrl}"`,
-  ].join(' ');
+  ].filter(Boolean).join(' ');
 }
 
 // Cobalt proxy download endpoint
@@ -128,15 +144,12 @@ app.post('/ytdlp', async (req, res) => {
         try {
           const audioData = fs.readFileSync(outFile);
           const base64Audio = audioData.toString('base64');
-
           console.log(`[ytdlp] Sending callback for ${videoId}, size: ${audioData.length} bytes`);
-
           await fetch(callbackUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ videoId, audio: base64Audio }),
           });
-
           console.log(`[ytdlp] Callback sent for ${videoId}`);
         } catch (cbErr) {
           console.error('[ytdlp] Callback/read error:', cbErr.message);
@@ -153,7 +166,12 @@ app.post('/ytdlp', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', activeJobs, queueLength: jobQueue.length });
+  res.json({
+    status: 'ok',
+    activeJobs,
+    queueLength: jobQueue.length,
+    cookiesLoaded: fs.existsSync(COOKIES_FILE)
+  });
 });
 
 app.listen(PORT, () => {
