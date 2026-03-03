@@ -97,7 +97,8 @@ function buildYtDlpCmd(videoId, outFile) {
   const proxyArg = RESIDENTIAL_PROXY ? `--proxy "${RESIDENTIAL_PROXY}"` : '';
   return [
     'yt-dlp', '-x',
-    '--audio-format mp3', '--audio-quality 5',
+    '--audio-format opus', '--audio-quality 9',
+    '--postprocessor-args', 'ffmpeg:-ac 1 -b:a 32k',
     `-o "${outFile}"`,
     '--no-playlist', '--no-check-certificates', '--age-limit 99',
     `--js-runtimes "node:${NODE_PATH}"`,
