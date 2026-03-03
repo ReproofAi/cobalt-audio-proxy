@@ -15,8 +15,8 @@ try { NODE_PATH = execSync('which node').toString().trim(); } catch (e) {}
 console.log(`[startup] Node.js path for yt-dlp: ${NODE_PATH}`);
 
 // Concurrency config
-const MAX_CONCURRENT = 2;  // max parallel yt-dlp processes
-const MAX_QUEUE = 4;        // max jobs waiting in memory — reject beyond this to avoid OOM
+const MAX_CONCURRENT = 2;
+const MAX_QUEUE = 4;
 
 let activeJobs = 0;
 const jobQueue = [];
@@ -32,10 +32,7 @@ function runWithConcurrencyLimit(fn) {
           .catch(reject)
           .finally(() => {
             activeJobs--;
-            if (jobQueue.length > 0) {
-              const next = jobQueue.shift();
-              next();
-            }
+            if (jobQueue.length > 0) jobQueue.shift()();
           });
       } else {
         jobQueue.push(attempt);
@@ -45,7 +42,8 @@ function runWithConcurrencyLimit(fn) {
   });
 }
 
-// Build yt-dlp command with JS runtime + android_vr player client
+// Build yt-dlp command — use ios/mweb clients to bypass bot detection
+// ios client is authenticated and doesn't require cookies for most videos
 function buildYtDlpCmd(videoId, outFile) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   return [
@@ -55,23 +53,18 @@ function buildYtDlpCmd(videoId, outFile) {
     '--audio-quality 5',
     `-o "${outFile}"`,
     '--no-playlist',
-    `--js-runtimes "node:${NODE_PATH}"`,
-    '--extractor-args "youtube:player_client=android_vr,web"',
+    // ios client bypasses bot detection and doesn't need cookies
+    '--extractor-args "youtube:player_client=ios,android,mweb"',
+    // Skip age gate attempts to avoid login prompts
+    '--extractor-args "youtube:player_skip=webpage,configs,js"',
+    '--no-check-certificates',
     `"${ytUrl}"`,
   ].join(' ');
 }
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'cobalt-audio-proxy',
-    activeJobs,
-    queued: jobQueue.length,
-    maxConcurrent: MAX_CONCURRENT,
-    maxQueue: MAX_QUEUE,
-    nodePath: NODE_PATH,
-  });
+  res.json({ status: 'ok', service: 'cobalt-audio-proxy', activeJobs, queued: jobQueue.length });
 });
 
 // Download proxy: accepts a videoId, calls Cobalt internally
@@ -81,12 +74,11 @@ app.post('/download', async (req, res) => {
     let audioUrl = tunnelUrl;
 
     if (videoId && !tunnelUrl) {
-      const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
       console.log(`[download-proxy] Calling Cobalt for videoId: ${videoId}`);
       const cobaltRes = await fetch(`${COBALT_URL}/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ url: youtubeUrl, audioFormat: 'mp3', isAudioOnly: true }),
+        body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${videoId}`, audioFormat: 'mp3', isAudioOnly: true }),
       });
       const cobaltData = await cobaltRes.json();
       console.log(`[download-proxy] Cobalt response status: ${cobaltData.status}`);
@@ -108,25 +100,18 @@ app.post('/download', async (req, res) => {
     res.setHeader('Content-Type', 'audio/mpeg');
     res.send(buffer);
   } catch (err) {
-    console.error('[download-proxy] Error:', err.message);
     res.status(500).json({ error: err.message?.substring(0, 300) });
   }
 });
 
-// yt-dlp endpoint — async callback with concurrency + queue cap to prevent OOM
+// yt-dlp endpoint — async callback with concurrency + queue cap
 app.post('/ytdlp', async (req, res) => {
   const { videoId, callbackUrl, callbackHeaders } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
 
-  // Reject if queue is full — caller should retry later (staleness logic will rescue it)
   if (jobQueue.length >= MAX_QUEUE) {
     console.log(`[ytdlp] Queue full (${jobQueue.length}/${MAX_QUEUE}), rejecting ${videoId}`);
-    return res.status(429).json({
-      error: 'queue_full',
-      message: `Queue at capacity (${MAX_QUEUE}). Retry later.`,
-      activeJobs,
-      queued: jobQueue.length,
-    });
+    return res.status(429).json({ error: 'queue_full', activeJobs, queued: jobQueue.length });
   }
 
   const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp3`);
@@ -141,17 +126,15 @@ app.post('/ytdlp', async (req, res) => {
       console.log(`[ytdlp] Starting download for ${videoId}`);
       exec(cmd, { timeout: 300000 }, async (err, stdout, stderr) => {
         if (err) {
-          const errMsg = (stderr || err.message || '').substring(0, 300);
-          console.error(`[ytdlp] Error for ${videoId}:`, errMsg);
+          console.error(`[ytdlp] Error for ${videoId}:`, (stderr || err.message || '').substring(0, 300));
           resolve();
           return;
         }
         try {
           const stat = fs.statSync(outFile);
           console.log(`[ytdlp] Sending ${stat.size} bytes to callback for ${videoId}`);
-          const fileStream = fs.createReadStream(outFile);
           const chunks = [];
-          for await (const chunk of fileStream) chunks.push(chunk);
+          for await (const chunk of fs.createReadStream(outFile)) chunks.push(chunk);
           const audioBuffer = Buffer.concat(chunks);
           const cbRes = await fetch(callbackUrl, {
             method: 'POST',
@@ -170,7 +153,7 @@ app.post('/ytdlp', async (req, res) => {
     return;
   }
 
-  // Synchronous mode (no callback)
+  // Synchronous mode
   try {
     await runWithConcurrencyLimit(() => new Promise((resolve, reject) => {
       exec(cmd, { timeout: 300000 }, (err) => { if (err) reject(err); else resolve(); });
@@ -188,8 +171,7 @@ app.post('/ytdlp', async (req, res) => {
 // Forward all other requests to upstream Cobalt
 app.all('*', async (req, res) => {
   try {
-    const targetUrl = `${COBALT_URL}${req.path}`;
-    const upstreamRes = await fetch(targetUrl, {
+    const upstreamRes = await fetch(`${COBALT_URL}${req.path}`, {
       method: req.method,
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: req.method !== 'GET' && req.method !== 'HEAD' ? JSON.stringify(req.body) : undefined,
