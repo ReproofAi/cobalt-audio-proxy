@@ -4,14 +4,43 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const app = express();
-app.use(express.json({ limit: '500mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const COBALT_URL = process.env.COBALT_UPSTREAM_URL || 'https://cobalt-production-a07d.up.railway.app';
 const PORT = process.env.PORT || 3000;
 
+// Concurrency limiter — max 2 yt-dlp jobs at once to prevent OOM
+let activeJobs = 0;
+const MAX_CONCURRENT = 2;
+const jobQueue = [];
+
+function runWithConcurrencyLimit(fn) {
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      if (activeJobs < MAX_CONCURRENT) {
+        activeJobs++;
+        Promise.resolve()
+          .then(fn)
+          .then(resolve)
+          .catch(reject)
+          .finally(() => {
+            activeJobs--;
+            if (jobQueue.length > 0) {
+              const next = jobQueue.shift();
+              next();
+            }
+          });
+      } else {
+        jobQueue.push(attempt);
+      }
+    };
+    attempt();
+  });
+}
+
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'cobalt-audio-proxy' });
+  res.json({ status: 'ok', service: 'cobalt-audio-proxy', activeJobs, queued: jobQueue.length });
 });
 
 // Download proxy: accepts a videoId, calls Cobalt API internally,
@@ -56,7 +85,7 @@ app.post('/download', async (req, res) => {
   }
 });
 
-// yt-dlp fallback endpoint - supports async callback pattern
+// yt-dlp fallback endpoint - async callback pattern with concurrency limiting
 app.post('/ytdlp', async (req, res) => {
   const { videoId, callbackUrl, callbackHeaders } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
@@ -65,55 +94,63 @@ app.post('/ytdlp', async (req, res) => {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const cmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${outFile}" --no-playlist "${ytUrl}"`;
 
-  console.log(`[ytdlp] Downloading audio for ${videoId}...`);
+  console.log(`[ytdlp] Queued job for ${videoId} (active: ${activeJobs}, queued: ${jobQueue.length})`);
 
   // If caller provided a callbackUrl, respond immediately and process in background
   if (callbackUrl) {
-    res.status(202).json({ status: 'accepted', videoId });
+    res.status(202).json({ status: 'accepted', videoId, activeJobs, queued: jobQueue.length });
 
-    exec(cmd, { timeout: 300000 }, async (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[ytdlp] Error for ${videoId}:`, err.message);
-        return;
-      }
-      try {
-        const audioBuffer = fs.readFileSync(outFile);
-        console.log(`[ytdlp] Sending ${audioBuffer.length} bytes to callback for ${videoId}`);
-        await fetch(callbackUrl, {
-          method: 'POST',
-          headers: {
-            ...callbackHeaders,
-            'Content-Type': 'audio/mpeg',
-          },
-          body: audioBuffer,
-        });
-        console.log(`[ytdlp] Callback sent for ${videoId}`);
-      } catch (cbErr) {
-        console.error(`[ytdlp] Callback failed for ${videoId}:`, cbErr.message);
-      } finally {
-        fs.unlink(outFile, () => {});
-      }
-    });
+    runWithConcurrencyLimit(() => new Promise((resolve) => {
+      console.log(`[ytdlp] Starting download for ${videoId} (active slots: ${activeJobs}/${MAX_CONCURRENT})`);
+      exec(cmd, { timeout: 300000 }, async (err) => {
+        if (err) {
+          console.error(`[ytdlp] yt-dlp error for ${videoId}:`, err.message?.substring(0, 200));
+          resolve();
+          return;
+        }
+        try {
+          // Stream file to callback instead of loading into memory
+          const stat = fs.statSync(outFile);
+          console.log(`[ytdlp] Sending ${stat.size} bytes to callback for ${videoId}`);
+          const fileStream = fs.createReadStream(outFile);
+          const chunks = [];
+          for await (const chunk of fileStream) chunks.push(chunk);
+          const audioBuffer = Buffer.concat(chunks);
+          await fetch(callbackUrl, {
+            method: 'POST',
+            headers: { ...callbackHeaders, 'Content-Type': 'audio/mpeg' },
+            body: audioBuffer,
+          });
+          console.log(`[ytdlp] Callback sent for ${videoId}`);
+        } catch (cbErr) {
+          console.error(`[ytdlp] Callback failed for ${videoId}:`, cbErr.message?.substring(0, 200));
+        } finally {
+          fs.unlink(outFile, () => {});
+          resolve();
+        }
+      });
+    }));
     return;
   }
 
-  // No callback - synchronous mode (stream back audio)
-  exec(cmd, { timeout: 300000 }, (err, stdout, stderr) => {
-    if (err) {
-      console.error(`[ytdlp] Error for ${videoId}:`, err.message);
-      return res.status(500).json({ error: err.message?.substring(0, 500) });
-    }
-    try {
-      const audioBuffer = fs.readFileSync(outFile);
-      console.log(`[ytdlp] Returning ${audioBuffer.length} bytes for ${videoId}`);
-      res.set('Content-Type', 'audio/mpeg');
-      res.send(audioBuffer);
-    } catch (readErr) {
-      res.status(500).json({ error: readErr.message });
-    } finally {
-      fs.unlink(outFile, () => {});
-    }
-  });
+  // No callback - synchronous mode
+  try {
+    await runWithConcurrencyLimit(() => new Promise((resolve, reject) => {
+      console.log(`[ytdlp] Sync download for ${videoId}`);
+      exec(cmd, { timeout: 300000 }, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    }));
+    const audioBuffer = fs.readFileSync(outFile);
+    console.log(`[ytdlp] Returning ${audioBuffer.length} bytes for ${videoId}`);
+    res.set('Content-Type', 'audio/mpeg');
+    res.send(audioBuffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message?.substring(0, 500) });
+  } finally {
+    fs.unlink(outFile, () => {});
+  }
 });
 
 // Forward all other requests to upstream Cobalt service
@@ -133,5 +170,5 @@ app.all('*', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`cobalt-audio-proxy listening on port ${PORT}`);
+  console.log(`cobalt-audio-proxy listening on port ${PORT} (max concurrent yt-dlp jobs: ${MAX_CONCURRENT})`);
 });
