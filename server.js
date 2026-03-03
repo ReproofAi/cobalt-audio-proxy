@@ -2,7 +2,7 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-const COBALT_URL = process.env.COBALT_UPSTREAM_URL || 'http://localhost:9000';
+const COBALT_URL = process.env.COBALT_UPSTREAM_URL || 'https://cobalt-production-a07d.up.railway.app';
 const PORT = process.env.PORT || 3000;
 
 // Health check
@@ -10,15 +10,47 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'cobalt-audio-proxy' });
 });
 
-// Download proxy: buffers a tunnel stream URL and returns raw audio bytes
+// Download proxy: accepts a videoId, calls Cobalt API internally,
+// buffers the tunnel stream, and returns raw audio bytes
 app.post('/download', async (req, res) => {
   try {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ error: 'Missing url' });
+    const { videoId, url: tunnelUrl } = req.body;
 
-    console.log('[download-proxy] Fetching tunnel:', url.slice(0, 100) + '...');
+    let audioUrl = tunnelUrl;
+    let cobaltStatus = null;
 
-    const response = await fetch(url, {
+    // If videoId is provided, call Cobalt API ourselves to get the tunnel URL
+    if (videoId && !tunnelUrl) {
+      const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      console.log(`[download-proxy] Calling Cobalt for videoId: ${videoId}`);
+
+      const cobaltRes = await fetch(`${COBALT_URL}/`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({ url: youtubeUrl }),
+      });
+
+      const cobaltData = await cobaltRes.json();
+      console.log(`[download-proxy] Cobalt response: status=${cobaltData.status}, url=${cobaltData.url?.slice(0, 80)}...`);
+      cobaltStatus = cobaltData.status;
+
+      if (!cobaltRes.ok || cobaltData.error) {
+        return res.status(502).json({ error: cobaltData.error || 'Cobalt API error' });
+      }
+
+      audioUrl = cobaltData.url;
+    }
+
+    if (!audioUrl) {
+      return res.status(400).json({ error: 'Missing videoId or url' });
+    }
+
+    console.log(`[download-proxy] Fetching audio from: ${audioUrl.slice(0, 100)}...`);
+
+    const response = await fetch(audioUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'audio/*, */*',
@@ -27,8 +59,8 @@ app.post('/download', async (req, res) => {
     });
 
     if (!response.ok) {
-      console.error('[download-proxy] Upstream error:', response.status);
-      return res.status(response.status).json({ error: 'Upstream ' + response.status });
+      console.error(`[download-proxy] Upstream error: ${response.status}`);
+      return res.status(response.status).json({ error: `Upstream ${response.status}` });
     }
 
     const chunks = [];
@@ -42,7 +74,7 @@ app.post('/download', async (req, res) => {
       return res.status(502).json({ error: 'Tunnel returned 0 bytes' });
     }
 
-    console.log('[download-proxy] Downloaded', buffer.length, 'bytes, sending to client');
+    console.log(`[download-proxy] Downloaded ${buffer.length} bytes, sending to client`);
     const contentType = response.headers.get('content-type') || 'audio/mpeg';
     res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Length', buffer.length);
