@@ -56,26 +56,25 @@ function runWithConcurrencyLimit(fn) {
 
 async function fetchTranscriptPython(videoId) {
   return new Promise((resolve) => {
-    const pyLines = [
+    // Write Python script to temp file to avoid shell quoting issues
+    const scriptFile = require('path').join(require('os').tmpdir(), `transcript_${videoId}.py`);
+    const pyCode = [
       'import sys',
-      `video_id = "${videoId}"`,
-      'def run():',
+      `vid = "${videoId}"`,
+      'try:',
       '    from youtube_transcript_api import YouTubeTranscriptApi',
-      '    try:',
-      '        api = YouTubeTranscriptApi()',
-      '        t = api.fetch(video_id, languages=["en","en-US","en-GB"])',
-      '        print(" ".join([s.text for s in t]))',
-      '        return',
-      '    except Exception: pass',
-      '    t = YouTubeTranscriptApi.get_transcript(video_id, languages=["en","en-US","en-GB"])',
-      '    print(" ".join([x["text"] for x in t]))',
-      'try: run()',
-      'except Exception as e: sys.stderr.write(str(e)); sys.exit(1)',
-    ].join("\n");
-    const cmd = `python3 -c "${pyLines.replace(/"/g, '\\\"')}"`;
-    exec(cmd, { timeout: 30000 }, (err, stdout, stderr) => {
+      '    api = YouTubeTranscriptApi()',
+      '    t = api.fetch(vid, languages=["en","en-US","en-GB"])',
+      '    print(" ".join([s.text for s in t]))',
+      'except Exception as e:',
+      '    sys.stderr.write(str(e))',
+      '    sys.exit(1)',
+    ].join('\n');
+    require('fs').writeFileSync(scriptFile, pyCode);
+    exec(`python3 "${scriptFile}"`, { timeout: 30000 }, (err, stdout, stderr) => {
+      try { require('fs').unlinkSync(scriptFile); } catch(_) {}
       if (err) {
-        console.warn(`[transcript-api] Failed for ${videoId}: ${(stderr||'').slice(0,200)||err.message}`);
+        console.warn(`[transcript-api] Failed for ${videoId}: ${(stderr||'').slice(0,300)||err.message}`);
         resolve(null);
       } else {
         const text = stdout.trim();
@@ -83,13 +82,14 @@ async function fetchTranscriptPython(videoId) {
           console.log(`[transcript-api] Got transcript for ${videoId}: ${text.length} chars`);
           resolve(text);
         } else {
-          console.warn(`[transcript-api] Transcript too short for ${videoId}`);
+          console.warn(`[transcript-api] Transcript too short for ${videoId}: ${text.length} chars`);
           resolve(null);
         }
       }
     });
   });
 }
+
 
 function buildYtDlpCmd(videoId, outFile) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
