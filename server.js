@@ -1,4 +1,8 @@
 const express = require('express');
+const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const app = express();
 app.use(express.json());
 
@@ -15,109 +19,81 @@ app.get('/', (req, res) => {
 app.post('/download', async (req, res) => {
   try {
     const { videoId, url: tunnelUrl } = req.body;
-
     let audioUrl = tunnelUrl;
-    let cobaltStatus = null;
 
-    // If videoId is provided, call Cobalt API ourselves to get the tunnel URL
     if (videoId && !tunnelUrl) {
       const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
       console.log(`[download-proxy] Calling Cobalt for videoId: ${videoId}`);
-
       const cobaltRes = await fetch(`${COBALT_URL}/`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify({ url: youtubeUrl }),
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ url: youtubeUrl, audioFormat: 'mp3', isAudioOnly: true }),
       });
-
       const cobaltData = await cobaltRes.json();
-      console.log(`[download-proxy] Cobalt response: status=${cobaltData.status}, url=${cobaltData.url?.slice(0, 80)}...`);
-      cobaltStatus = cobaltData.status;
-
-      if (!cobaltRes.ok || cobaltData.error) {
-        return res.status(502).json({ error: cobaltData.error || 'Cobalt API error' });
+      console.log(`[download-proxy] Cobalt response status: ${cobaltData.status}`);
+      if (cobaltData.status === 'tunnel' || cobaltData.status === 'redirect' || cobaltData.status === 'stream') {
+        audioUrl = cobaltData.url;
+      } else {
+        return res.status(502).json({ error: `Cobalt returned status: ${cobaltData.status}`, cobaltData });
       }
-
-      audioUrl = cobaltData.url;
     }
 
-    if (!audioUrl) {
-      return res.status(400).json({ error: 'Missing videoId or url' });
-    }
+    if (!audioUrl) return res.status(400).json({ error: 'No URL or videoId provided' });
 
-    console.log(`[download-proxy] Fetching audio from: ${audioUrl.slice(0, 100)}...`);
-
-    const response = await fetch(audioUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'audio/*, */*',
-        'Accept-Encoding': 'identity',
-      },
+    console.log(`[download-proxy] Downloading audio from tunnel URL`);
+    const audioRes = await fetch(audioUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     });
-
-    if (!response.ok) {
-      console.error(`[download-proxy] Upstream error: ${response.status}`);
-      return res.status(response.status).json({ error: `Upstream ${response.status}` });
-    }
-
-    const chunks = [];
-    for await (const chunk of response.body) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    const buffer = Buffer.concat(chunks);
-
-    if (buffer.length === 0) {
-      console.error('[download-proxy] Got 0 bytes from tunnel');
-      return res.status(502).json({ error: 'Tunnel returned 0 bytes' });
-    }
-
-    console.log(`[download-proxy] Downloaded ${buffer.length} bytes, sending to client`);
-    const contentType = response.headers.get('content-type') || 'audio/mpeg';
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Length', buffer.length);
+    if (!audioRes.ok) return res.status(502).json({ error: `Tunnel fetch failed: ${audioRes.status}` });
+    const buffer = Buffer.from(await audioRes.arrayBuffer());
+    console.log(`[download-proxy] Downloaded ${buffer.length} bytes`);
+    if (buffer.length === 0) return res.status(502).json({ error: 'Tunnel returned 0 bytes' });
+    res.setHeader('Content-Type', 'audio/mpeg');
     res.send(buffer);
   } catch (err) {
     console.error('[download-proxy] Error:', err.message);
+    res.status(500).json({ error: err.message?.substring(0, 500) || 'download failed' });
+  }
+});
+
+// yt-dlp fallback endpoint
+app.post('/ytdlp', async (req, res) => {
+  const { videoId } = req.body;
+  if (!videoId) return res.status(400).json({ error: 'videoId required' });
+  const tmpFile = path.join(os.tmpdir(), `${videoId}.mp3`);
+  try {
+    console.log(`[ytdlp] Downloading audio for videoId: ${videoId}`);
+    execSync(
+      `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${tmpFile}" --no-playlist "https://www.youtube.com/watch?v=${videoId}"`,
+      { timeout: 120000, stdio: 'pipe' }
+    );
+    const buffer = fs.readFileSync(tmpFile);
+    fs.unlinkSync(tmpFile);
+    if (buffer.length === 0) return res.status(502).json({ error: 'yt-dlp returned 0 bytes' });
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.send(buffer);
+  } catch (err) {
+    try { fs.unlinkSync(tmpFile); } catch {}
+    res.status(500).json({ error: err.message?.substring(0, 500) || 'yt-dlp failed' });
+  }
+});
+
+// Forward all other requests to upstream Cobalt service
+app.all('*', async (req, res) => {
+  try {
+    const targetUrl = `${COBALT_URL}${req.path}`;
+    const upstreamRes = await fetch(targetUrl, {
+      method: req.method,
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: req.method !== 'GET' && req.method !== 'HEAD' ? JSON.stringify(req.body) : undefined,
+    });
+    const data = await upstreamRes.json();
+    res.status(upstreamRes.status).json(data);
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Forward all other requests to the upstream Cobalt service
-app.use('*', async (req, res) => {
-  try {
-    const targetUrl = COBALT_URL + req.originalUrl;
-    const fetchOptions = {
-      method: req.method,
-      headers: { ...req.headers, host: new URL(COBALT_URL).host },
-    };
-    if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
-      fetchOptions.body = JSON.stringify(req.body);
-      fetchOptions.headers['content-type'] = 'application/json';
-    }
-
-    const upstreamRes = await fetch(targetUrl, fetchOptions);
-    const data = await upstreamRes.json().catch(() => null);
-
-    res.status(upstreamRes.status);
-    upstreamRes.headers.forEach((value, key) => {
-      if (!['transfer-encoding', 'connection'].includes(key.toLowerCase())) {
-        res.setHeader(key, value);
-      }
-    });
-    if (data !== null) {
-      res.json(data);
-    } else {
-      res.end();
-    }
-  } catch (err) {
-    console.error('[proxy] Forward error:', err.message);
-    res.status(502).json({ error: err.message });
-  }
-});
-
 app.listen(PORT, () => {
-  console.log('cobalt-audio-proxy listening on port', PORT);
+  console.log(`cobalt-audio-proxy listening on port ${PORT}`);
 });
