@@ -8,16 +8,38 @@ app.use(express.json({ limit: '10mb' }));
 
 const COBALT_URL = process.env.COBALT_UPSTREAM_URL || 'https://cobalt-production-a07d.up.railway.app';
 const PORT = process.env.PORT || 3000;
-const RESIDENTIAL_PROXY = process.env.RESIDENTIAL_PROXY_URL || '';
+
+// Proxy rotation: RESIDENTIAL_PROXY_LIST is comma-separated list of proxy URLs
+// e.g. "http://user:pass@ip1:port1,http://user:pass@ip2:port2"
+// RESIDENTIAL_PROXY_URL is fallback for single proxy (legacy)
+function parseProxyList() {
+  const listEnv = process.env.RESIDENTIAL_PROXY_LIST || '';
+  const singleEnv = process.env.RESIDENTIAL_PROXY_URL || '';
+  if (listEnv) {
+    return listEnv.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  if (singleEnv) return [singleEnv];
+  return [];
+}
+
+const PROXY_LIST = parseProxyList();
+let proxyIndex = 0;
+
+function getNextProxy() {
+  if (PROXY_LIST.length === 0) return '';
+  const proxy = PROXY_LIST[proxyIndex % PROXY_LIST.length];
+  proxyIndex++;
+  return proxy;
+}
 
 let NODE_PATH = '/usr/local/bin/node';
 try { NODE_PATH = execSync('which node').toString().trim(); } catch (e) {}
 console.log(`[startup] Node path: ${NODE_PATH}`);
 
-if (RESIDENTIAL_PROXY) {
-  console.log('[startup] Residential proxy configured:', RESIDENTIAL_PROXY.replace(/:[^@]+@/, ':***@'));
+if (PROXY_LIST.length > 0) {
+  console.log(`[startup] ${PROXY_LIST.length} residential proxy/proxies configured (round-robin)`);
 } else {
-  console.warn('[startup] No RESIDENTIAL_PROXY_URL set');
+  console.warn('[startup] No residential proxies set (RESIDENTIAL_PROXY_LIST or RESIDENTIAL_PROXY_URL)');
 }
 
 const COOKIES_FILE = path.join(os.tmpdir(), 'yt-cookies.txt');
@@ -58,7 +80,10 @@ function runWithConcurrencyLimit(fn) {
 async function fetchTranscriptPython(videoId) {
   return new Promise((resolve) => {
     const scriptFile = path.join(os.tmpdir(), `transcript_${videoId}.py`);
-    const proxyLine = RESIDENTIAL_PROXY ? `os.environ['HTTP_PROXY'] = r"${RESIDENTIAL_PROXY}"; os.environ['HTTPS_PROXY'] = r"${RESIDENTIAL_PROXY}"` : '# no proxy';
+    const proxy = getNextProxy();
+    const proxyLine = proxy
+      ? `os.environ['HTTP_PROXY'] = r"${proxy}"; os.environ['HTTPS_PROXY'] = r"${proxy}"`
+      : '# no proxy';
     const pyLines = [
       'import sys, os',
       proxyLine,
@@ -73,6 +98,7 @@ async function fetchTranscriptPython(videoId) {
       '    sys.exit(1)',
     ].join('\n');
     fs.writeFileSync(scriptFile, pyLines);
+    if (proxy) console.log(`[transcript-api] Using proxy for ${videoId}: ${proxy.replace(/:[^@]+@/, ':***@')}`);
     exec(`python3 "${scriptFile}"`, { timeout: 30000 }, (err, stdout, stderr) => {
       try { fs.unlinkSync(scriptFile); } catch(_) {}
       if (err) {
@@ -92,10 +118,10 @@ async function fetchTranscriptPython(videoId) {
   });
 }
 
-function buildYtDlpCmd(videoId, outTemplate) {
+function buildYtDlpCmd(videoId, outTemplate, proxy) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const cookiesArg = fs.existsSync(COOKIES_FILE) ? `--cookies "${COOKIES_FILE}"` : '';
-  const proxyArg = RESIDENTIAL_PROXY ? `--proxy "${RESIDENTIAL_PROXY}"` : '';
+  const proxyArg = proxy ? `--proxy "${proxy}"` : '';
   return [
     'yt-dlp',
     '-x',
@@ -168,9 +194,11 @@ app.post('/ytdlp', async (req, res) => {
     }
 
     console.log(`[ytdlp] Transcript API failed, falling back to yt-dlp audio: ${videoId}`);
+    const proxy = getNextProxy();
+    if (proxy) console.log(`[ytdlp] Using proxy for download ${videoId}: ${proxy.replace(/:[^@]+@/, ':***@')}`);
     const timestamp = Date.now();
     const outTemplate = path.join(os.tmpdir(), `${videoId}_${timestamp}.%(ext)s`);
-    const cmd = buildYtDlpCmd(videoId, outTemplate);
+    const cmd = buildYtDlpCmd(videoId, outTemplate, proxy);
     console.log(`[ytdlp] Starting download: ${videoId}`);
 
     await new Promise((resolve, reject) => {
@@ -222,7 +250,8 @@ app.get('/health', (req, res) => {
     activeJobs,
     queueLength: jobQueue.length,
     cookiesLoaded: fs.existsSync(COOKIES_FILE),
-    residentialProxy: !!RESIDENTIAL_PROXY,
+    proxyCount: PROXY_LIST.length,
+    proxyIndex,
   });
 });
 
