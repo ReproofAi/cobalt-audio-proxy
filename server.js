@@ -1,10 +1,10 @@
 const express = require('express');
-const { execSync } = require('child_process');
+const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '500mb' }));
 
 const COBALT_URL = process.env.COBALT_UPSTREAM_URL || 'https://cobalt-production-a07d.up.railway.app';
 const PORT = process.env.PORT || 3000;
@@ -56,26 +56,64 @@ app.post('/download', async (req, res) => {
   }
 });
 
-// yt-dlp fallback endpoint
+// yt-dlp fallback endpoint - supports async callback pattern
 app.post('/ytdlp', async (req, res) => {
-  const { videoId } = req.body;
+  const { videoId, callbackUrl, callbackHeaders } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
-  const tmpFile = path.join(os.tmpdir(), `${videoId}.mp3`);
-  try {
-    console.log(`[ytdlp] Downloading audio for videoId: ${videoId}`);
-    execSync(
-      `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${tmpFile}" --no-playlist "https://www.youtube.com/watch?v=${videoId}"`,
-      { timeout: 120000, stdio: 'pipe' }
-    );
-    const buffer = fs.readFileSync(tmpFile);
-    fs.unlinkSync(tmpFile);
-    if (buffer.length === 0) return res.status(502).json({ error: 'yt-dlp returned 0 bytes' });
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.send(buffer);
-  } catch (err) {
-    try { fs.unlinkSync(tmpFile); } catch {}
-    res.status(500).json({ error: err.message?.substring(0, 500) || 'yt-dlp failed' });
+
+  const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp3`);
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${outFile}" --no-playlist "${ytUrl}"`;
+
+  console.log(`[ytdlp] Downloading audio for ${videoId}...`);
+
+  // If caller provided a callbackUrl, respond immediately and process in background
+  if (callbackUrl) {
+    res.status(202).json({ status: 'accepted', videoId });
+
+    exec(cmd, { timeout: 300000 }, async (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[ytdlp] Error for ${videoId}:`, err.message);
+        return;
+      }
+      try {
+        const audioBuffer = fs.readFileSync(outFile);
+        console.log(`[ytdlp] Sending ${audioBuffer.length} bytes to callback for ${videoId}`);
+        await fetch(callbackUrl, {
+          method: 'POST',
+          headers: {
+            ...callbackHeaders,
+            'Content-Type': 'audio/mpeg',
+          },
+          body: audioBuffer,
+        });
+        console.log(`[ytdlp] Callback sent for ${videoId}`);
+      } catch (cbErr) {
+        console.error(`[ytdlp] Callback failed for ${videoId}:`, cbErr.message);
+      } finally {
+        fs.unlink(outFile, () => {});
+      }
+    });
+    return;
   }
+
+  // No callback - synchronous mode (stream back audio)
+  exec(cmd, { timeout: 300000 }, (err, stdout, stderr) => {
+    if (err) {
+      console.error(`[ytdlp] Error for ${videoId}:`, err.message);
+      return res.status(500).json({ error: err.message?.substring(0, 500) });
+    }
+    try {
+      const audioBuffer = fs.readFileSync(outFile);
+      console.log(`[ytdlp] Returning ${audioBuffer.length} bytes for ${videoId}`);
+      res.set('Content-Type', 'audio/mpeg');
+      res.send(audioBuffer);
+    } catch (readErr) {
+      res.status(500).json({ error: readErr.message });
+    } finally {
+      fs.unlink(outFile, () => {});
+    }
+  });
 });
 
 // Forward all other requests to upstream Cobalt service
