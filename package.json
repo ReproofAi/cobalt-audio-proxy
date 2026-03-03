@@ -1,0 +1,12 @@
+{
+  "name": "cobalt-audio-proxy",
+  "version": "1.0.0",
+  "description": "Audio proxy for Cobalt tunnel streams",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
