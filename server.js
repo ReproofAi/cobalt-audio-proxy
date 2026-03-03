@@ -32,7 +32,10 @@ function runWithConcurrencyLimit(fn) {
           .catch(reject)
           .finally(() => {
             activeJobs--;
-            if (jobQueue.length > 0) jobQueue.shift()();
+            if (jobQueue.length > 0) {
+              const next = jobQueue.shift();
+              next();
+            }
           });
       } else {
         jobQueue.push(attempt);
@@ -42,8 +45,6 @@ function runWithConcurrencyLimit(fn) {
   });
 }
 
-// Build yt-dlp command — use ios/mweb clients to bypass bot detection
-// ios client is authenticated and doesn't require cookies for most videos
 function buildYtDlpCmd(videoId, outFile) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   return [
@@ -53,136 +54,108 @@ function buildYtDlpCmd(videoId, outFile) {
     '--audio-quality 5',
     `-o "${outFile}"`,
     '--no-playlist',
-    // ios client bypasses bot detection and doesn't need cookies
+    `--js-runtimes "node:${NODE_PATH}"`,
     '--extractor-args "youtube:player_client=ios,android,mweb"',
-    // Skip age gate attempts to avoid login prompts
-    '--extractor-args "youtube:player_skip=webpage,configs,js"',
     '--no-check-certificates',
     `"${ytUrl}"`,
   ].join(' ');
 }
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'cobalt-audio-proxy', activeJobs, queued: jobQueue.length });
-});
-
-// Download proxy: accepts a videoId, calls Cobalt internally
+// Cobalt proxy download endpoint
 app.post('/download', async (req, res) => {
-  try {
-    const { videoId, url: tunnelUrl } = req.body;
-    let audioUrl = tunnelUrl;
-
-    if (videoId && !tunnelUrl) {
-      console.log(`[download-proxy] Calling Cobalt for videoId: ${videoId}`);
-      const cobaltRes = await fetch(`${COBALT_URL}/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${videoId}`, audioFormat: 'mp3', isAudioOnly: true }),
-      });
-      const cobaltData = await cobaltRes.json();
-      console.log(`[download-proxy] Cobalt response status: ${cobaltData.status}`);
-      if (['tunnel', 'redirect', 'stream'].includes(cobaltData.status)) {
-        audioUrl = cobaltData.url;
-      } else {
-        return res.status(502).json({ error: `Cobalt returned status: ${cobaltData.status}` });
-      }
-    }
-
-    if (!audioUrl) return res.status(400).json({ error: 'No URL or videoId provided' });
-
-    const audioRes = await fetch(audioUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    });
-    if (!audioRes.ok) return res.status(502).json({ error: `Tunnel fetch failed: ${audioRes.status}` });
-    const buffer = Buffer.from(await audioRes.arrayBuffer());
-    if (buffer.length === 0) return res.status(502).json({ error: 'Tunnel returned 0 bytes' });
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.send(buffer);
-  } catch (err) {
-    res.status(500).json({ error: err.message?.substring(0, 300) });
-  }
-});
-
-// yt-dlp endpoint — async callback with concurrency + queue cap
-app.post('/ytdlp', async (req, res) => {
-  const { videoId, callbackUrl, callbackHeaders } = req.body;
+  const { videoId } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
 
-  if (jobQueue.length >= MAX_QUEUE) {
-    console.log(`[ytdlp] Queue full (${jobQueue.length}/${MAX_QUEUE}), rejecting ${videoId}`);
-    return res.status(429).json({ error: 'queue_full', activeJobs, queued: jobQueue.length });
-  }
-
-  const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp3`);
-  const cmd = buildYtDlpCmd(videoId, outFile);
-
-  console.log(`[ytdlp] Queued job for ${videoId} (active: ${activeJobs}/${MAX_CONCURRENT}, queued: ${jobQueue.length}/${MAX_QUEUE})`);
-
-  if (callbackUrl) {
-    res.status(202).json({ status: 'accepted', videoId, activeJobs, queued: jobQueue.length });
-
-    runWithConcurrencyLimit(() => new Promise((resolve) => {
-      console.log(`[ytdlp] Starting download for ${videoId}`);
-      exec(cmd, { timeout: 300000 }, async (err, stdout, stderr) => {
-        if (err) {
-          console.error(`[ytdlp] Error for ${videoId}:`, (stderr || err.message || '').substring(0, 300));
-          resolve();
-          return;
-        }
-        try {
-          const stat = fs.statSync(outFile);
-          console.log(`[ytdlp] Sending ${stat.size} bytes to callback for ${videoId}`);
-          const chunks = [];
-          for await (const chunk of fs.createReadStream(outFile)) chunks.push(chunk);
-          const audioBuffer = Buffer.concat(chunks);
-          const cbRes = await fetch(callbackUrl, {
-            method: 'POST',
-            headers: { ...callbackHeaders, 'Content-Type': 'audio/mpeg' },
-            body: audioBuffer,
-          });
-          console.log(`[ytdlp] Callback sent for ${videoId} — status: ${cbRes.status}`);
-        } catch (cbErr) {
-          console.error(`[ytdlp] Callback failed for ${videoId}:`, cbErr.message?.substring(0, 200));
-        } finally {
-          fs.unlink(outFile, () => {});
-          resolve();
-        }
-      });
-    }));
-    return;
-  }
-
-  // Synchronous mode
   try {
-    await runWithConcurrencyLimit(() => new Promise((resolve, reject) => {
-      exec(cmd, { timeout: 300000 }, (err) => { if (err) reject(err); else resolve(); });
-    }));
-    const audioBuffer = fs.readFileSync(outFile);
-    res.set('Content-Type', 'audio/mpeg');
-    res.send(audioBuffer);
+    const cobaltRes = await fetch(`${COBALT_URL}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        downloadMode: 'audio',
+        audioFormat: 'mp3',
+      }),
+    });
+    const data = await cobaltRes.json();
+    if (data.url) {
+      return res.json({ url: data.url });
+    }
+    return res.status(502).json({ error: 'Cobalt did not return a URL', detail: data });
   } catch (err) {
-    res.status(500).json({ error: err.message?.substring(0, 300) });
-  } finally {
-    fs.unlink(outFile, () => {});
+    console.error('[cobalt] Error:', err.message);
+    return res.status(502).json({ error: err.message });
   }
 });
 
-// Forward all other requests to upstream Cobalt
-app.all('*', async (req, res) => {
-  try {
-    const upstreamRes = await fetch(`${COBALT_URL}${req.path}`, {
-      method: req.method,
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: req.method !== 'GET' && req.method !== 'HEAD' ? JSON.stringify(req.body) : undefined,
-    });
-    const data = await upstreamRes.json();
-    res.status(upstreamRes.status).json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+// yt-dlp async endpoint
+app.post('/ytdlp', async (req, res) => {
+  const { videoId, callbackUrl } = req.body;
+  if (!videoId || !callbackUrl) {
+    return res.status(400).json({ error: 'videoId and callbackUrl required' });
   }
+
+  if (jobQueue.length >= MAX_QUEUE) {
+    console.warn(`[ytdlp] Queue full (${MAX_QUEUE}), rejecting ${videoId}`);
+    return res.status(429).json({ error: 'queue_full', message: 'Too many pending jobs, try again later' });
+  }
+
+  res.status(202).json({ status: 'queued', videoId });
+
+  runWithConcurrencyLimit(async () => {
+    const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp3`);
+    const cmd = buildYtDlpCmd(videoId, outFile);
+    console.log(`[ytdlp] Starting download: ${videoId}`);
+
+    await new Promise((resolve, reject) => {
+      exec(cmd, { timeout: 300000 }, async (err, stdout, stderr) => {
+        if (err) {
+          console.error(`[ytdlp] Error for ${videoId}:`, err.message);
+          console.error(`[ytdlp] stderr:`, stderr?.slice(0, 500));
+          try {
+            await fetch(callbackUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ videoId, error: err.message }),
+            });
+          } catch (cbErr) {
+            console.error('[ytdlp] Callback error:', cbErr.message);
+          }
+          return reject(err);
+        }
+
+        console.log(`[ytdlp] Download complete: ${videoId}`);
+
+        try {
+          const audioData = fs.readFileSync(outFile);
+          const base64Audio = audioData.toString('base64');
+
+          console.log(`[ytdlp] Sending callback for ${videoId}, size: ${audioData.length} bytes`);
+
+          await fetch(callbackUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ videoId, audio: base64Audio }),
+          });
+
+          console.log(`[ytdlp] Callback sent for ${videoId}`);
+        } catch (cbErr) {
+          console.error('[ytdlp] Callback/read error:', cbErr.message);
+        } finally {
+          try { fs.unlinkSync(outFile); } catch (_) {}
+        }
+
+        resolve();
+      });
+    });
+  }).catch(err => {
+    console.error(`[ytdlp] Job failed for ${videoId}:`, err.message);
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', activeJobs, queueLength: jobQueue.length });
 });
 
 app.listen(PORT, () => {
-  console.log(`cobalt-audio-proxy listening on port ${PORT} (max: ${MAX_CONCURRENT} concurrent, ${MAX_QUEUE} queued)`);
+  console.log(`cobalt-audio-proxy listening on port ${PORT}`);
 });
