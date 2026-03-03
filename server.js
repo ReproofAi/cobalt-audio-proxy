@@ -13,6 +13,7 @@ const RESIDENTIAL_PROXY = process.env.RESIDENTIAL_PROXY_URL || '';
 let NODE_PATH = '/usr/local/bin/node';
 try { NODE_PATH = execSync('which node').toString().trim(); } catch (e) {}
 console.log(`[startup] Node path: ${NODE_PATH}`);
+
 if (RESIDENTIAL_PROXY) {
   console.log('[startup] Residential proxy configured:', RESIDENTIAL_PROXY.replace(/:[^@]+@/, ':***@'));
 } else {
@@ -56,23 +57,24 @@ function runWithConcurrencyLimit(fn) {
 
 async function fetchTranscriptPython(videoId) {
   return new Promise((resolve) => {
-    // Write Python script to temp file to avoid shell quoting issues
-    const scriptFile = require('path').join(require('os').tmpdir(), `transcript_${videoId}.py`);
-    const pyCode = [
-      'import sys',
+    const scriptFile = path.join(os.tmpdir(), `transcript_${videoId}.py`);
+    const proxyLine = RESIDENTIAL_PROXY ? `os.environ['HTTP_PROXY'] = r"${RESIDENTIAL_PROXY}"; os.environ['HTTPS_PROXY'] = r"${RESIDENTIAL_PROXY}"` : '# no proxy';
+    const pyLines = [
+      'import sys, os',
+      proxyLine,
       `vid = "${videoId}"`,
       'try:',
       '    from youtube_transcript_api import YouTubeTranscriptApi',
       '    api = YouTubeTranscriptApi()',
-      '    t = api.fetch(vid, languages=["en","en-US","en-GB"])',
+      `    t = api.fetch(vid, languages=["en","en-US","en-GB"])`,
       '    print(" ".join([s.text for s in t]))',
       'except Exception as e:',
       '    sys.stderr.write(str(e))',
       '    sys.exit(1)',
     ].join('\n');
-    require('fs').writeFileSync(scriptFile, pyCode);
+    fs.writeFileSync(scriptFile, pyLines);
     exec(`python3 "${scriptFile}"`, { timeout: 30000 }, (err, stdout, stderr) => {
-      try { require('fs').unlinkSync(scriptFile); } catch(_) {}
+      try { fs.unlinkSync(scriptFile); } catch(_) {}
       if (err) {
         console.warn(`[transcript-api] Failed for ${videoId}: ${(stderr||'').slice(0,300)||err.message}`);
         resolve(null);
@@ -90,21 +92,34 @@ async function fetchTranscriptPython(videoId) {
   });
 }
 
-
-function buildYtDlpCmd(videoId, outFile) {
+function buildYtDlpCmd(videoId, outTemplate) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const cookiesArg = fs.existsSync(COOKIES_FILE) ? `--cookies "${COOKIES_FILE}"` : '';
   const proxyArg = RESIDENTIAL_PROXY ? `--proxy "${RESIDENTIAL_PROXY}"` : '';
   return [
-    'yt-dlp', '-x',
-    '--audio-format opus', '--audio-quality 9',
-    `-o "${outFile}"`,
-    '--no-playlist', '--no-check-certificates', '--age-limit 99',
+    'yt-dlp',
+    '-x',
+    '--audio-format opus',
+    '--audio-quality 9',
+    `-o "${outTemplate}"`,
+    '--no-playlist',
+    '--no-check-certificates',
+    '--age-limit 99',
     `--js-runtimes "node:${NODE_PATH}"`,
     '--extractor-args "youtube:player_client=android,web"',
-    cookiesArg, proxyArg,
+    cookiesArg,
+    proxyArg,
     `"${ytUrl}"`,
   ].filter(Boolean).join(' ');
+}
+
+function findDownloadedFile(tmpDir, videoId, timestamp) {
+  const prefix = `${videoId}_${timestamp}`;
+  try {
+    const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(prefix));
+    if (files.length > 0) return path.join(tmpDir, files[0]);
+  } catch (_) {}
+  return null;
 }
 
 app.post('/download', async (req, res) => {
@@ -136,7 +151,6 @@ app.post('/ytdlp', async (req, res) => {
 
   runWithConcurrencyLimit(async () => {
     console.log(`[ytdlp] Processing ${videoId}`);
-
     const transcript = await fetchTranscriptPython(videoId);
     if (transcript) {
       console.log(`[ytdlp] Sending transcript callback for ${videoId}`);
@@ -154,8 +168,9 @@ app.post('/ytdlp', async (req, res) => {
     }
 
     console.log(`[ytdlp] Transcript API failed, falling back to yt-dlp audio: ${videoId}`);
-    const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.ogg`);
-    const cmd = buildYtDlpCmd(videoId, outFile);
+    const timestamp = Date.now();
+    const outTemplate = path.join(os.tmpdir(), `${videoId}_${timestamp}.%(ext)s`);
+    const cmd = buildYtDlpCmd(videoId, outTemplate);
     console.log(`[ytdlp] Starting download: ${videoId}`);
 
     await new Promise((resolve, reject) => {
@@ -172,8 +187,16 @@ app.post('/ytdlp', async (req, res) => {
           return reject(err);
         }
         console.log(`[ytdlp] Download done: ${videoId}`);
+        const actualFile = findDownloadedFile(os.tmpdir(), videoId, timestamp);
+        if (!actualFile) {
+          console.error(`[ytdlp] Audio file not found for ${videoId}`);
+          try {
+            await fetch(callbackUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ videoId, error: 'file not found after download' }) });
+          } catch (_) {}
+          return resolve();
+        }
         try {
-          const audioData = fs.readFileSync(outFile);
+          const audioData = fs.readFileSync(actualFile);
           const base64Audio = audioData.toString('base64');
           console.log(`[ytdlp] Sending audio callback: ${videoId}, ${audioData.length} bytes`);
           await fetch(callbackUrl, {
@@ -185,7 +208,7 @@ app.post('/ytdlp', async (req, res) => {
         } catch (cbErr) {
           console.error('[ytdlp] Audio callback error:', cbErr.message);
         } finally {
-          try { fs.unlinkSync(outFile); } catch (_) {}
+          try { fs.unlinkSync(actualFile); } catch (_) {}
         }
         resolve();
       });
@@ -195,7 +218,9 @@ app.post('/ytdlp', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', activeJobs, queueLength: jobQueue.length,
+    status: 'ok',
+    activeJobs,
+    queueLength: jobQueue.length,
     cookiesLoaded: fs.existsSync(COOKIES_FILE),
     residentialProxy: !!RESIDENTIAL_PROXY,
   });
