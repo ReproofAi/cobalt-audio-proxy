@@ -56,16 +56,23 @@ function runWithConcurrencyLimit(fn) {
 
 async function fetchTranscriptPython(videoId) {
   return new Promise((resolve) => {
-    const cmd = `python3 -c "
-import sys
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    t = YouTubeTranscriptApi.get_transcript('${videoId}', languages=['en','en-US','en-GB'])
-    print(' '.join([x['text'] for x in t]))
-except Exception as e:
-    sys.stderr.write(str(e))
-    sys.exit(1)
-"`;
+    const pyLines = [
+      'import sys',
+      `video_id = "${videoId}"`,
+      'def run():',
+      '    from youtube_transcript_api import YouTubeTranscriptApi',
+      '    try:',
+      '        api = YouTubeTranscriptApi()',
+      '        t = api.fetch(video_id, languages=["en","en-US","en-GB"])',
+      '        print(" ".join([s.text for s in t]))',
+      '        return',
+      '    except Exception: pass',
+      '    t = YouTubeTranscriptApi.get_transcript(video_id, languages=["en","en-US","en-GB"])',
+      '    print(" ".join([x["text"] for x in t]))',
+      'try: run()',
+      'except Exception as e: sys.stderr.write(str(e)); sys.exit(1)',
+    ].join("\n");
+    const cmd = `python3 -c "${pyLines.replace(/"/g, '\\\"')}"`;
     exec(cmd, { timeout: 30000 }, (err, stdout, stderr) => {
       if (err) {
         console.warn(`[transcript-api] Failed for ${videoId}: ${(stderr||'').slice(0,200)||err.message}`);
