@@ -11,14 +11,14 @@ const PORT = process.env.PORT || 3000;
 
 // Detect Node.js path for yt-dlp JS runtime
 let NODE_PATH = '/usr/local/bin/node';
-try {
-  NODE_PATH = execSync('which node').toString().trim();
-} catch (e) {}
+try { NODE_PATH = execSync('which node').toString().trim(); } catch (e) {}
 console.log(`[startup] Node.js path for yt-dlp: ${NODE_PATH}`);
 
-// Concurrency limiter — max 2 yt-dlp jobs at once to prevent OOM
+// Concurrency config
+const MAX_CONCURRENT = 2;  // max parallel yt-dlp processes
+const MAX_QUEUE = 4;        // max jobs waiting in memory — reject beyond this to avoid OOM
+
 let activeJobs = 0;
-const MAX_CONCURRENT = 2;
 const jobQueue = [];
 
 function runWithConcurrencyLimit(fn) {
@@ -45,11 +45,9 @@ function runWithConcurrencyLimit(fn) {
   });
 }
 
-// Build yt-dlp command with JS runtime so YouTube extraction works
+// Build yt-dlp command with JS runtime + android_vr player client
 function buildYtDlpCmd(videoId, outFile) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  // Pass Node.js as the JS runtime so yt-dlp can extract YouTube formats
-  // Also use android_vr player client as fallback which doesn't need JS
   return [
     'yt-dlp',
     '-x',
@@ -65,10 +63,18 @@ function buildYtDlpCmd(videoId, outFile) {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'cobalt-audio-proxy', activeJobs, queued: jobQueue.length, nodePath: NODE_PATH });
+  res.json({
+    status: 'ok',
+    service: 'cobalt-audio-proxy',
+    activeJobs,
+    queued: jobQueue.length,
+    maxConcurrent: MAX_CONCURRENT,
+    maxQueue: MAX_QUEUE,
+    nodePath: NODE_PATH,
+  });
 });
 
-// Download proxy: accepts a videoId, calls Cobalt API internally
+// Download proxy: accepts a videoId, calls Cobalt internally
 app.post('/download', async (req, res) => {
   try {
     const { videoId, url: tunnelUrl } = req.body;
@@ -84,10 +90,10 @@ app.post('/download', async (req, res) => {
       });
       const cobaltData = await cobaltRes.json();
       console.log(`[download-proxy] Cobalt response status: ${cobaltData.status}`);
-      if (cobaltData.status === 'tunnel' || cobaltData.status === 'redirect' || cobaltData.status === 'stream') {
+      if (['tunnel', 'redirect', 'stream'].includes(cobaltData.status)) {
         audioUrl = cobaltData.url;
       } else {
-        return res.status(502).json({ error: `Cobalt returned status: ${cobaltData.status}`, cobaltData });
+        return res.status(502).json({ error: `Cobalt returned status: ${cobaltData.status}` });
       }
     }
 
@@ -103,19 +109,30 @@ app.post('/download', async (req, res) => {
     res.send(buffer);
   } catch (err) {
     console.error('[download-proxy] Error:', err.message);
-    res.status(500).json({ error: err.message?.substring(0, 500) || 'download failed' });
+    res.status(500).json({ error: err.message?.substring(0, 300) });
   }
 });
 
-// yt-dlp fallback endpoint - async callback pattern with concurrency limiting
+// yt-dlp endpoint — async callback with concurrency + queue cap to prevent OOM
 app.post('/ytdlp', async (req, res) => {
   const { videoId, callbackUrl, callbackHeaders } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
 
+  // Reject if queue is full — caller should retry later (staleness logic will rescue it)
+  if (jobQueue.length >= MAX_QUEUE) {
+    console.log(`[ytdlp] Queue full (${jobQueue.length}/${MAX_QUEUE}), rejecting ${videoId}`);
+    return res.status(429).json({
+      error: 'queue_full',
+      message: `Queue at capacity (${MAX_QUEUE}). Retry later.`,
+      activeJobs,
+      queued: jobQueue.length,
+    });
+  }
+
   const outFile = path.join(os.tmpdir(), `${videoId}_${Date.now()}.mp3`);
   const cmd = buildYtDlpCmd(videoId, outFile);
 
-  console.log(`[ytdlp] Queued job for ${videoId} (active: ${activeJobs}/${MAX_CONCURRENT}, queued: ${jobQueue.length})`);
+  console.log(`[ytdlp] Queued job for ${videoId} (active: ${activeJobs}/${MAX_CONCURRENT}, queued: ${jobQueue.length}/${MAX_QUEUE})`);
 
   if (callbackUrl) {
     res.status(202).json({ status: 'accepted', videoId, activeJobs, queued: jobQueue.length });
@@ -136,12 +153,12 @@ app.post('/ytdlp', async (req, res) => {
           const chunks = [];
           for await (const chunk of fileStream) chunks.push(chunk);
           const audioBuffer = Buffer.concat(chunks);
-          await fetch(callbackUrl, {
+          const cbRes = await fetch(callbackUrl, {
             method: 'POST',
             headers: { ...callbackHeaders, 'Content-Type': 'audio/mpeg' },
             body: audioBuffer,
           });
-          console.log(`[ytdlp] Callback sent for ${videoId}`);
+          console.log(`[ytdlp] Callback sent for ${videoId} — status: ${cbRes.status}`);
         } catch (cbErr) {
           console.error(`[ytdlp] Callback failed for ${videoId}:`, cbErr.message?.substring(0, 200));
         } finally {
@@ -162,13 +179,13 @@ app.post('/ytdlp', async (req, res) => {
     res.set('Content-Type', 'audio/mpeg');
     res.send(audioBuffer);
   } catch (err) {
-    res.status(500).json({ error: err.message?.substring(0, 500) });
+    res.status(500).json({ error: err.message?.substring(0, 300) });
   } finally {
     fs.unlink(outFile, () => {});
   }
 });
 
-// Forward all other requests to upstream Cobalt service
+// Forward all other requests to upstream Cobalt
 app.all('*', async (req, res) => {
   try {
     const targetUrl = `${COBALT_URL}${req.path}`;
@@ -185,5 +202,5 @@ app.all('*', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`cobalt-audio-proxy listening on port ${PORT} (max concurrent yt-dlp jobs: ${MAX_CONCURRENT})`);
+  console.log(`cobalt-audio-proxy listening on port ${PORT} (max: ${MAX_CONCURRENT} concurrent, ${MAX_QUEUE} queued)`);
 });
