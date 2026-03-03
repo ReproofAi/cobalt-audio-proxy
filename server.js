@@ -132,7 +132,8 @@ function buildYtDlpCmd(videoId, outTemplate, proxy) {
     '--no-check-certificates',
     '--age-limit 99',
     `--js-runtimes "node:${NODE_PATH}"`,
-    '--extractor-args "youtube:player_client=android,web"',
+    // Use web-only when cookies present (android skips cookies)
+    cookiesArg ? '--extractor-args "youtube:player_client=web"' : '--extractor-args "youtube:player_client=android,web"',
     cookiesArg,
     proxyArg,
     `"${ytUrl}"`,
